@@ -1,0 +1,55 @@
+name: 碳酸锂日报
+
+# 触发条件：
+# 1. 每个工作日 UTC 1:00（北京时间 9:00）自动运行
+# 2. 手动触发（workflow_dispatch），方便测试
+on:
+  schedule:
+    # UTC 1:00 = 北京时间 9:00（工作日开盘前）
+    # cron 设置为每天跑，脚本内部会判断是否工作日
+    - cron: "0 1 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      force_run:
+        description: "强制运行（跳过工作日判断）"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+jobs:
+  daily-report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run report
+        env:
+          # ============ 推送通道（按需填入，不用的留空） ============
+          # 飞书机器人 Webhook（多个逗号分隔）
+          FEISHU_WEBHOOKS: ${{ secrets.FEISHU_WEBHOOKS }}
+          # 飞书加签密钥（多个逗号分隔，与 Webhook 一一对应；无加签则留空）
+          FEISHU_SECRETS: ${{ secrets.FEISHU_SECRETS }}
+          # 企业微信群机器人 Webhook（多个逗号分隔）
+          WECOM_WEBHOOKS: ${{ secrets.WECOM_WEBHOOKS }}
+          # Server酱 SendKey（多个逗号分隔，在 https://sct.ftqq.com/ 获取）
+          SERVERCHAN_KEYS: ${{ secrets.SERVERCHAN_KEYS }}
+          # ============ 运行控制 ============
+          # 强制运行（手动触发时自动设置）
+          FORCE_RUN: ${{ github.event.inputs.force_run || 'false' }}
+          # 调试模式
+          DEBUG: ${{ secrets.DEBUG || 'true' }}
+        run: python run.py

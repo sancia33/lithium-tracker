@@ -1,22 +1,26 @@
 """碳酸锂价格数据源模块。
 
-数据源（全部使用东方财富公开接口，稳定可靠）：
-1. 期货行情：东财 clist 接口，广期所市场编号 225，碳酸锂代码 lc
-2. 期货历史：东财 kline 接口，取碳酸锂主连(225.lcm) 最近收盘数据
-3. 现货报价：东财 clist 接口，筛选碳酸锂相关品种
+数据源（多源兜底策略）：
+1. 东方财富 push2 - 广期所碳酸锂期货行情（主源）
+2. 东方财富 push2his - 碳酸锂主连K线（兜底）
+3. 新浪财经 - 碳酸锂期货合约（额外兜底）
+4. 现货参考：期货主连价格
 
-关键发现：
-- 广期所(GFEX)在东方财富的市场编号是 225（不是142）
-- 碳酸锂期货代码：lc + 年月（如 lc2608）
-- 碳酸锂主连代码：lcm
-- 碳酸锂次主连代码：lcs
+关键信息：
+- 广期所(GFEX)在东方财富的市场编号 = 225
+- 碳酸锂主连 secid = 225.lcm
+- 碳酸锂合约 secid = 225.lc2608 等
+- 所有请求通过 _get() 统一处理，内置重试
 """
 import datetime
 import re
+import time
 from dataclasses import dataclass, field
 from typing import List, Optional
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from .config import REQUEST_TIMEOUT, DEBUG
 
@@ -28,27 +32,49 @@ HEADERS = {
     "Referer": "https://www.eastmoney.com/",
 }
 
-# 广期所在东财的市场编号
+# 带重试的 Session
+_session = requests.Session()
+_retry = Retry(
+    total=3,
+    backoff_factor=1,
+    status_forcelist=[500, 502, 503, 504],
+    allowed_methods=["GET"],
+)
+_session.mount("https://", HTTPAdapter(max_retries=_retry))
+_session.mount("http://", HTTPAdapter(max_retries=_retry))
+
+
+def _get(url: str, params: dict = None, timeout: int = None,
+         headers: dict = None) -> requests.Response:
+    """统一的 GET 请求，内置重试（自动重试 502/503/504）。"""
+    if timeout is None:
+        timeout = REQUEST_TIMEOUT
+    if headers is None:
+        headers = HEADERS
+    return _session.get(url, params=params, headers=headers, timeout=timeout)
+
+
+# 广期所市场编号
 GFEX_MKT = "225"
 
 
 @dataclass
 class PriceItem:
     """单条价格信息。"""
-    name: str            # 名称，如「碳酸锂主连」
-    price: str           # 最新价/报价
-    change: str = ""     # 涨跌
-    change_pct: str = "" # 涨跌幅
-    source: str = ""     # 数据来源
-    extra: str = ""      # 附加说明
+    name: str
+    price: str
+    change: str = ""
+    change_pct: str = ""
+    source: str = ""
+    extra: str = ""
 
 
 @dataclass
 class DataResult:
     """一次抓取的聚合结果。"""
-    futures: List[PriceItem] = field(default_factory=list)   # 期货
-    spot: List[PriceItem] = field(default_factory=list)      # 现货
-    errors: List[str] = field(default_factory=list)          # 各源失败原因
+    futures: List[PriceItem] = field(default_factory=list)
+    spot: List[PriceItem] = field(default_factory=list)
+    errors: List[str] = field(default_factory=list)
 
 
 def _log(msg: str) -> None:
@@ -56,285 +82,208 @@ def _log(msg: str) -> None:
         print(f"  [datasource] {msg}")
 
 
-def _format_price(raw) -> str:
-    """将东财返回的价格格式化为可读字符串（单位：元/吨）。"""
+def _fmt_price(raw) -> str:
     try:
         val = float(raw)
-        if val >= 10000:
-            return f"{val:,.0f} 元/吨"
-        return f"{val} 元/吨"
+        return f"{val:,.0f} 元/吨" if val >= 10000 else f"{val} 元/吨"
     except (ValueError, TypeError):
         return str(raw)
 
 
-def _format_change_pct(raw) -> str:
-    """格式化涨跌幅。"""
+def _fmt_pct(raw) -> str:
     try:
-        val = float(raw)
-        return f"{val:+.2f}%"
+        return f"{float(raw):+.2f}%"
     except (ValueError, TypeError):
         return str(raw)
 
 
-def _format_change(raw) -> str:
-    """格式化涨跌额。"""
+def _fmt_chg(raw) -> str:
     try:
-        val = float(raw)
-        return f"{val:+,.0f}"
+        return f"{float(raw):+,.0f}"
     except (ValueError, TypeError):
         return str(raw)
+
+
+def _parse_clist_row(row: dict) -> Optional[PriceItem]:
+    """解析东财 clist 接口的一行数据。"""
+    code = str(row.get("f12", ""))
+    name = str(row.get("f14", ""))
+    price = row.get("f2")
+    if "碳酸锂" not in name and not code.startswith("lc"):
+        return None
+    if price in (None, "-", ""):
+        return None
+    extra = ""
+    if code == "lcm":
+        extra = "主力合约"
+        name = "碳酸锂主连"
+    elif code == "lcs":
+        extra = "次主力"
+        name = "碳酸锂次主连"
+    return PriceItem(
+        name=name + "(期货)",
+        price=_fmt_price(price),
+        change=_fmt_chg(row.get("f4", "")),
+        change_pct=_fmt_pct(row.get("f3", "")),
+        source="东方财富",
+        extra=extra,
+    )
 
 
 # ============================================================
-# 数据源 1：东方财富 - 广期所碳酸锂期货行情列表
+# 数据源 1：东财 push2 - 广期所碳酸锂期货行情
 # ============================================================
-def fetch_em_futures() -> List[PriceItem]:
-    """从东财 clist 接口获取广期所碳酸锂全部合约实时行情。
-    自动识别主连、次主连、及各月合约。
-    """
+def fetch_em_push2() -> List[PriceItem]:
+    """东财 push2 接口（实时行情，最全）。"""
     items = []
-    try:
-        url = "https://push2.eastmoney.com/api/qt/clist/get"
-        params = {
-            "pn": "1", "pz": "30", "po": "1", "np": "1",
-            "fltt": "2", "invt": "2",
-            "fid": "f3",
-            "fs": f"m:{GFEX_MKT}",
-            "fields": "f2,f3,f4,f12,f14",
-        }
-        r = requests.get(url, params=params, headers=HEADERS, timeout=REQUEST_TIMEOUT)
-        r.raise_for_status()
-        resp = r.json()
-        diff = (resp.get("data") or {}).get("diff") or []
-        if not isinstance(diff, list):
-            raise RuntimeError(f"东财返回格式异常: {type(diff)}")
-
-        for row in diff:
-            code = str(row.get("f12", ""))
-            name = str(row.get("f14", ""))
-            price = row.get("f2")
-            # 只保留碳酸锂相关
-            if "碳酸锂" not in name and not code.startswith("lc"):
-                continue
-            if price in (None, "-", ""):
-                continue
-            # 优先展示主连
-            is_main = code == "lcm"
-            is_sub = code == "lcs"
-            extra = "主力合约" if is_main else ("次主力" if is_sub else "")
-
-            items.append(PriceItem(
-                name=name + "(期货)",
-                price=_format_price(price),
-                change=_format_change(row.get("f4", "")),
-                change_pct=_format_change_pct(row.get("f3", "")),
-                source="东方财富",
-                extra=extra,
-            ))
-
-        # 排序：主连 > 次主连 > 按合约月份
-        def _sort_key(it: PriceItem) -> int:
-            if it.extra == "主力合约":
-                return 0
-            if it.extra == "次主力":
-                return 1
-            return 2
-        items.sort(key=_sort_key)
-
-        _log(f"东财期货: 获取 {len(items)} 条")
-    except Exception as e:
-        raise RuntimeError(f"东方财富期货源失败: {e}")
+    url = "https://push2.eastmoney.com/api/qt/clist/get"
+    params = {
+        "pn": "1", "pz": "30", "po": "1", "np": "1",
+        "fltt": "2", "invt": "2", "fid": "f3",
+        "fs": f"m:{GFEX_MKT}",
+        "fields": "f2,f3,f4,f12,f14",
+    }
+    r = _get(url, params)
+    r.raise_for_status()
+    resp = r.json()
+    diff = (resp.get("data") or {}).get("diff") or []
+    if not isinstance(diff, list):
+        raise RuntimeError(f"东财返回格式异常: {type(diff)}")
+    for row in diff:
+        item = _parse_clist_row(row)
+        if item:
+            items.append(item)
+    # 排序
+    items.sort(key=lambda it: 0 if it.extra == "主力合约" else (1 if it.extra == "次主力" else 2))
+    _log(f"东财push2: 获取 {len(items)} 条")
     return items
 
 
 # ============================================================
-# 数据源 2：东方财富 - 碳酸锂主连历史K线（兜底）
+# 数据源 2：东财 push2his - K线（兜底）
 # ============================================================
 def fetch_em_kline() -> List[PriceItem]:
-    """从东财 kline 接口获取碳酸锂主连最近交易日数据。
-    作为 clist 接口的兜底方案。
-    """
+    """东财 kline 接口（历史数据，作为实时接口的兜底）。"""
     items = []
-    try:
-        url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
-        params = {
-            "secid": f"{GFEX_MKT}.lcm",
-            "fields1": "f1,f2,f3,f4,f5,f6",
-            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58",
-            "klt": "101",  # 日K
-            "fqt": "1",
-            "beg": "0",
-            "end": "20500101",
-            "lmt": "3",    # 最近3个交易日
-        }
-        r = requests.get(url, params=params, headers=HEADERS, timeout=REQUEST_TIMEOUT)
-        r.raise_for_status()
-        data = r.json().get("data")
-        if not data:
-            raise RuntimeError("kline 接口返回 data 为空")
+    url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+    params = {
+        "secid": f"{GFEX_MKT}.lcm",
+        "fields1": "f1,f2,f3,f4,f5,f6",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58",
+        "klt": "101", "fqt": "1",
+        "beg": "0", "end": "20500101", "lmt": "3",
+    }
+    r = _get(url, params)
+    r.raise_for_status()
+    data = r.json().get("data")
+    if not data:
+        raise RuntimeError("kline data 为空")
+    name = data.get("name", "碳酸锂主连")
+    klines = data.get("klines", [])
+    if not klines:
+        raise RuntimeError("klines 为空")
 
-        name = data.get("name", "碳酸锂主连")
-        klines = data.get("klines", [])
-        if not klines:
-            raise RuntimeError("kline 无数据")
+    last = klines[-1].split(",")
+    if len(last) < 8:
+        raise RuntimeError("kline 格式异常")
+    trade_date, open_p, close_p = last[0], last[1], last[2]
+    high, low = last[3], last[4]
 
-        # 取最后一条（最近交易日）
-        last = klines[-1]
-        fields = last.split(",")
-        # 格式：日期,开盘,收盘,最高,最低,成交量,成交额,振幅
-        if len(fields) >= 8:
-            trade_date = fields[0]
-            close_price = fields[2]
-            open_price = fields[1]
-            high = fields[3]
-            low = fields[4]
-            amplitude = fields[7]
+    change, change_pct = "", ""
+    if len(klines) >= 2:
+        prev_close = float(klines[-2].split(",")[2])
+        curr_close = float(close_p)
+        chg = curr_close - prev_close
+        change = f"{chg:+,.0f}"
+        if prev_close != 0:
+            change_pct = f"{chg / prev_close * 100:+.2f}%"
 
-            # 计算涨跌（需要前一天数据）
-            change = ""
-            change_pct = ""
-            if len(klines) >= 2:
-                prev = klines[-2].split(",")
-                if len(prev) >= 3:
-                    try:
-                        prev_close = float(prev[2])
-                        curr_close = float(close_price)
-                        chg = curr_close - prev_close
-                        change = f"{chg:+,.0f}"
-                        if prev_close != 0:
-                            change_pct = f"{chg / prev_close * 100:+.2f}%"
-                    except ValueError:
-                        pass
-
-            items.append(PriceItem(
-                name=f"{name}(期货)",
-                price=_format_price(close_price),
-                change=change,
-                change_pct=change_pct,
-                source="东方财富",
-                extra=f"主力合约 | {trade_date} | 开{float(open_price):,.0f} 高{float(high):,.0f} 低{float(low):,.0f}",
-            ))
-        _log(f"东财K线: 获取 {len(items)} 条")
-    except Exception as e:
-        raise RuntimeError(f"东方财富K线源失败: {e}")
+    items.append(PriceItem(
+        name=f"{name}(期货)",
+        price=_fmt_price(close_p),
+        change=change,
+        change_pct=change_pct,
+        source="东方财富",
+        extra=f"主力合约 | {trade_date} | 开{float(open_p):,.0f} 高{float(high):,.0f} 低{float(low):,.0f}",
+    ))
+    _log(f"东财K线: 获取 {len(items)} 条 (日期: {trade_date})")
     return items
 
 
 # ============================================================
-# 数据源 3：东财期货行情提取现货参考价
+# 数据源 3：新浪财经 - 碳酸锂期货（额外兜底）
 # ============================================================
-def _extract_spot_from_futures(futures_items: List[PriceItem]) -> List[PriceItem]:
-    """从期货合约中提取现货参考信息。
-    主力合约价格通常最接近现货，标注为「现货参考价」。
-    """
+def fetch_sina_futures() -> List[PriceItem]:
+    """新浪财经期货行情接口。合约代码：lc + 年月（小写）。"""
+    items = []
+    now = datetime.date.today()
+    codes = []
+    for y_offset in range(2):
+        y = now.year + y_offset
+        for m in range(1, 13):
+            codes.append(f"lc{y % 100}{m:02d}")
+
+    url = f"https://hq.sinajs.cn/list={','.join(codes)}"
+    sina_headers = {**HEADERS, "Referer": "https://finance.sina.com.cn"}
+    r = _get(url, headers=sina_headers)
+    r.raise_for_status()
+    r.encoding = "gbk"
+
+    for code in codes:
+        m = re.search(r'hq_str_' + code + r'="([^"]*)"', r.text)
+        if not m:
+            continue
+        fields = m.group(1).split(",")
+        if len(fields) < 10 or not fields[0]:
+            continue
+        # 0=名称 1=昨结 3=最新 4=最高 5=最低
+        name, prev_settle, latest = fields[0], fields[1], fields[3]
+        if not latest:
+            continue
+
+        change, change_pct = "", ""
+        try:
+            chg = float(latest) - float(prev_settle)
+            change = f"{chg:+,.0f}"
+            if float(prev_settle) != 0:
+                change_pct = f"{chg / float(prev_settle) * 100:+.2f}%"
+        except ValueError:
+            pass
+
+        extra = ""
+        # 判断是否主力（最新价最高的近月合约通常为主力）
+        if code == f"lc{now.year % 100}{now.month:02d}":
+            extra = "近月合约"
+
+        items.append(PriceItem(
+            name=f"{name}(期货)",
+            price=_fmt_price(latest),
+            change=change,
+            change_pct=change_pct,
+            source="新浪财经",
+            extra=extra,
+        ))
+
+    # 只保留有价格的
+    if items:
+        _log(f"新浪期货: 获取 {len(items)} 条")
+    return items
+
+
+# ============================================================
+# 现货参考价
+# ============================================================
+def _spot_from_futures(futures_items: List[PriceItem]) -> List[PriceItem]:
     items = []
     for it in futures_items:
         if "主连" in it.name and it.price:
-            # 主连价格作为现货参考
             items.append(PriceItem(
                 name="碳酸锂现货参考价",
                 price=it.price,
-                source="东方财富(期货主连参考)",
+                source="期货主连参考",
                 extra="主连价格贴近现货",
             ))
             break
-    return items
-
-
-# ============================================================
-# 数据源 4：上海有色网(SMM) - 碳酸锂现货（网页抓取）
-# ============================================================
-def fetch_smm_spot() -> List[PriceItem]:
-    """从上海有色网(SMM)抓取碳酸锂现货价格。"""
-    items = []
-    try:
-        # SMM 价格中心
-        urls = [
-            "https://hq.smm.cn/lithium_carbonate",
-            "https://www.smm.cn/metal/lithium_carbonate",
-        ]
-        for url in urls:
-            try:
-                r = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
-                if r.status_code != 200:
-                    continue
-                r.encoding = "utf-8"
-                html = r.text
-
-                # 匹配价格区间
-                for m in re.finditer(r"(\d{4,7})\s*[-~至]\s*(\d{4,7})\s*元/吨", html):
-                    items.append(PriceItem(
-                        name="电池级碳酸锂现货",
-                        price=f"{m.group(1)}-{m.group(2)} 元/吨",
-                        source="上海有色网(SMM)",
-                    ))
-                    break
-
-                if not items:
-                    for m in re.finditer(r"均价[：:]\s*([\d,.]+)\s*元", html):
-                        items.append(PriceItem(
-                            name="碳酸锂现货均价",
-                            price=m.group(1) + " 元/吨",
-                            source="上海有色网(SMM)",
-                        ))
-                        break
-
-                if items:
-                    break
-            except Exception:
-                continue
-
-        _log(f"SMM现货: 获取 {len(items)} 条")
-    except Exception as e:
-        raise RuntimeError(f"SMM现货源失败: {e}")
-    return items
-
-
-# ============================================================
-# 数据源 5：生意社 - 碳酸锂现货（网页抓取）
-# ============================================================
-def fetch_shengjishe_spot() -> List[PriceItem]:
-    """从生意社抓取碳酸锂现货价格。"""
-    items = []
-    try:
-        urls = [
-            "https://www.100ppi.com/commodity/5761.html",
-            "https://www.100ppi.com/kb/detail-5761.html",
-        ]
-        for url in urls:
-            try:
-                r = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
-                if r.status_code != 200:
-                    continue
-                r.encoding = "utf-8"
-                html = r.text
-
-                for m in re.finditer(r"最新价格[：:]\s*([\d,.]+)\s*元?/?吨?", html):
-                    items.append(PriceItem(
-                        name="碳酸锂现货",
-                        price=m.group(1) + " 元/吨",
-                        source="生意社",
-                        extra="最新价",
-                    ))
-                    break
-
-                if not items:
-                    for m in re.finditer(r"报价[：:]\s*([\d,.]+)", html):
-                        items.append(PriceItem(
-                            name="碳酸锂现货",
-                            price=m.group(1) + " 元/吨",
-                            source="生意社",
-                        ))
-                        break
-
-                if items:
-                    break
-            except Exception:
-                continue
-
-        _log(f"生意社现货: 获取 {len(items)} 条")
-    except Exception as e:
-        raise RuntimeError(f"生意社源失败: {e}")
     return items
 
 
@@ -345,33 +294,29 @@ def collect_all() -> DataResult:
     """聚合所有数据源，失败不影响整体。"""
     result = DataResult()
 
-    # 期货：东财 clist → kline 兜底
+    # 期货：东财push2 → 东财K线 → 新浪 三重兜底
     try:
-        result.futures.extend(fetch_em_futures())
+        result.futures.extend(fetch_em_push2())
     except Exception as e:
         result.errors.append(str(e))
+        _log(f"push2失败({e})，尝试K线...")
         try:
             result.futures.extend(fetch_em_kline())
         except Exception as e2:
             result.errors.append(str(e2))
+            _log(f"K线也失败({e2})，尝试新浪...")
+            try:
+                result.futures.extend(fetch_sina_futures())
+            except Exception as e3:
+                result.errors.append(str(e3))
 
-    # 现货：SMM → 生意社 → 期货主连参考 兜底
-    try:
-        result.spot.extend(fetch_smm_spot())
-    except Exception as e:
-        result.errors.append(str(e))
-        try:
-            result.spot.extend(fetch_shengjishe_spot())
-        except Exception as e2:
-            result.errors.append(str(e2))
-
-    # 如果现货全部失败，用期货主连价格作为现货参考
+    # 现货参考：期货主连
     if not result.spot and result.futures:
-        result.spot.extend(_extract_spot_from_futures(result.futures))
+        result.spot.extend(_spot_from_futures(result.futures))
 
-    # 只保留主连 + 次主连 + 前3个月份合约（避免信息过载）
-    main_items = [it for it in result.futures if it.extra in ("主力合约", "次主力")]
-    month_items = [it for it in result.futures if it.extra not in ("主力合约", "次主力")][:3]
-    result.futures = main_items + month_items
+    # 期货只保留主连 + 次主连 + 前3个月份
+    main = [it for it in result.futures if it.extra in ("主力合约", "次主力")]
+    others = [it for it in result.futures if it.extra not in ("主力合约", "次主力")][:3]
+    result.futures = main + others
 
     return result

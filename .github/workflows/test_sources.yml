@@ -1,0 +1,109 @@
+name: 接口测试
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install requests
+      - name: 测试数据源接口
+        run: |
+          python -c "
+          import requests, json, re
+          h = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36', 'Referer': 'https://www.eastmoney.com/'}
+
+          print('=== 1. 东财 push2his K线 主连 ===')
+          try:
+              r = requests.get('https://push2his.eastmoney.com/api/qt/stock/kline/get', params={
+                  'secid':'225.lcm','fields1':'f1,f2,f3','fields2':'f51,f52,f53,f54,f55,f56,f57,f58',
+                  'klt':'101','fqt':'1','beg':'0','end':'20500101','lmt':'2',
+              }, headers=h, timeout=15)
+              data = r.json().get('data',{})
+              klines = data.get('klines',[])
+              print(f'  名称: {data.get(\"name\")} 条数: {len(klines)}')
+              if klines:
+                  print(f'  最新: {klines[-1]}')
+          except Exception as e:
+              print(f'  失败: {e}')
+
+          print('=== 2. 东财 push2his K线 次主连 ===')
+          try:
+              r = requests.get('https://push2his.eastmoney.com/api/qt/stock/kline/get', params={
+                  'secid':'225.lcs','fields1':'f1,f2,f3','fields2':'f51,f52,f53,f54,f55,f56,f57,f58',
+                  'klt':'101','fqt':'1','beg':'0','end':'20500101','lmt':'2',
+              }, headers=h, timeout=15)
+              data = r.json().get('data',{})
+              klines = data.get('klines',[])
+              print(f'  名称: {data.get(\"name\")} 条数: {len(klines)}')
+              if klines: print(f'  最新: {klines[-1]}')
+          except Exception as e:
+              print(f'  失败: {e}')
+
+          print('=== 3. 新浪期货 ===')
+          try:
+              r = requests.get('https://hq.sinajs.cn/list=lc2607,lc2608,lc2609,lc2610,lc2611,lc2612', headers={**h,'Referer':'https://finance.sina.com.cn'}, timeout=15)
+              r.encoding='gbk'
+              for line in r.text.strip().split('\n'):
+                  if line.strip():
+                      m = re.search(r'hq_str_(lc\d+)=\"([^\"]*)\"', line)
+                      if m and m.group(2):
+                          print(f'  {m.group(1)}: {m.group(2)[:80]}')
+          except Exception as e:
+              print(f'  失败: {e}')
+
+          print('=== 4. 东财资讯 JSONP ===')
+          try:
+              r = requests.get('https://search-api-web.eastmoney.com/search/jsonp', params={
+                  'cb':'cb','param':'碳酸锂','type':'cmsArticleWebOld',
+                  'token':'D43BF722C8E33BDC906FB84D85E326E8','pageindex':'0','pagesize':'5',
+              }, headers=h, timeout=15)
+              m = re.search(r'\((\{.*\})\)', r.text, re.S)
+              if m:
+                  data = json.loads(m.group(1))
+                  result = data.get('result',{})
+                  for k,v in result.items():
+                      if isinstance(v,list) and len(v)>0 and isinstance(v[0],dict):
+                          is_user = 'stockFollowerCount' in v[0]
+                          print(f'  {k}: {len(v)}条 is_user={is_user} keys={list(v[0].keys())[:5]}')
+          except Exception as e:
+              print(f'  失败: {e}')
+
+          print('=== 5. 新浪财经资讯 ===')
+          try:
+              r = requests.get('https://feed.mix.sina.com.cn/api/roll/get', params={
+                  'pageid':'153','lid':'2516','k':'碳酸锂','num':'10','page':'1',
+              }, headers=h, timeout=15)
+              data = r.json()
+              items = data.get('result',{}).get('data',[]) or []
+              matched = [i for i in items if '锂' in i.get('title','')]
+              print(f'  总{len(items)} 含锂{len(matched)}')
+              for it in matched[:3]:
+                  print(f'  {it.get(\"title\",\"\")[:70]}')
+          except Exception as e:
+              print(f'  失败: {e}')
+
+          print('=== 6. RSS 中国化工网/氯碱 ===')
+          try:
+              r = requests.get('https://www.cls.cn/api/sw?app=CailianpressWeb&os=web&sv=7.7.5', json={'type':'telegraph','keyword':'碳酸锂','page':1,'rn':5}, headers=h, timeout=15)
+              print(f'  状态: {r.status_code} 内容: {r.text[:150]}')
+          except Exception as e:
+              print(f'  失败: {e}')
+
+          print('=== 7. 同花顺 ===')
+          try:
+              r = requests.get('https://news.10jqka.com.cn/tapp/news/push', params={'page':'1','limit':'5','tag':'碳酸锂'}, headers=h, timeout=15)
+              print(f'  状态: {r.status_code}')
+              try:
+                  data = r.json()
+                  items = data.get('data',{}).get('list',[]) if isinstance(data.get('data'),dict) else data.get('data',[])
+                  print(f'  条数: {len(items) if isinstance(items,list) else \"?\"}')
+              except: pass
+          except Exception as e:
+              print(f'  失败: {e}')
+          "
